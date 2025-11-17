@@ -1,52 +1,47 @@
 #!/usr/bin/env python3
-import requests
+import asyncio
+import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 from typing import Set, List, Optional
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 import time
 import random
 
 
-class WebCrawler:
-    def __init__(self, max_pages: int = 50, delay: float = 1.0, max_workers: int = 1):
+class AsyncWebCrawler:
+    def __init__(self, max_pages: int = 50, delay: float = 1.0, max_concurrent: int = 10):
         """
-        Initialize the web crawler.
+        Initialize the async web crawler.
         
         Args:
             max_pages: Maximum number of pages to crawl
-            delay: Delay between requests in seconds
-            max_workers: Number of concurrent threads (1 = single-threaded)
+            delay: Delay between batches in seconds
+            max_concurrent: Maximum number of concurrent requests
         """
         self.max_pages = max_pages
         self.delay = delay
-        self.max_workers = max_workers
+        self.max_concurrent = max_concurrent
         self.visited_urls: Set[str] = set()
         self.files_found: Set[str] = set()  # Track non-HTML files
-        self.lock = threading.Lock()  # Thread-safe access to shared data
-        self.session = requests.Session()
         self.user_agents = [
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
         ]
-        self.session.headers.update({
-            'User-Agent': self.user_agents[0]
-        })
+        self.current_user_agent = self.user_agents[0]
         self.robot_parser = RobotFileParser()
         self.max_retries = 3
         self.retry_delay_base = 2  # Base delay for exponential backoff
+        self.semaphore = asyncio.Semaphore(max_concurrent)  # Limit concurrent requests
     
     def rotate_user_agent(self) -> None:
         """Rotate to a different user agent."""
-        user_agent = random.choice(self.user_agents)
-        self.session.headers.update({'User-Agent': user_agent})
+        self.current_user_agent = random.choice(self.user_agents)
         print(f"  ↻ Rotated user agent")
     
-    def load_robots_txt(self, base_url: str) -> None:
+    async def load_robots_txt(self, base_url: str) -> None:
         """
         Load and parse the robots.txt file for the domain.
         
@@ -57,6 +52,7 @@ class WebCrawler:
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
         
         try:
+            # RobotFileParser.read() is synchronous, so we use it directly
             self.robot_parser.set_url(robots_url)
             self.robot_parser.read()
             print(f"Loaded robots.txt from: {robots_url}")
@@ -64,9 +60,6 @@ class WebCrawler:
             print(f"Could not load robots.txt: {e}")
             print("Proceeding without robots.txt restrictions")
     
-    # this is a boundary check to prevent the crawler from wandering off
-    # only follow sites in this domain. don't wander off to external sites
-    # and crawl the entire internet
     def is_valid_url(self, url: str, base_domain: str) -> bool:
         """
         Check if URL is valid and belongs to the same domain.
@@ -79,11 +72,6 @@ class WebCrawler:
         Returns:
             True if URL is valid, on same domain, and is an HTML page
         """
-
-        # If we have a url like "https://books.toscrape.com/page"
-        # urlparse(url).netloc will return "books.toscrape.com"
-        # netloc = network location. checks if the URL has a domain
-        # bool(netloc) is a short handed way to make sure netloc is not empty
         parsed = urlparse(url)
         
         # Must have a domain and match base domain
@@ -114,14 +102,15 @@ class WebCrawler:
         Returns:
             True if URL can be fetched
         """
-        user_agent = self.session.headers.get('User-Agent', '*')
-        return self.robot_parser.can_fetch(user_agent, url)
+        return self.robot_parser.can_fetch(self.current_user_agent, url)
     
-    def fetch_with_retry(self, url: str, timeout: int = 10, retry_count: int = 0) -> Optional[requests.Response]:
+    async def fetch_with_retry(self, client: httpx.AsyncClient, url: str, 
+                               timeout: int = 10, retry_count: int = 0) -> Optional[httpx.Response]:
         """
         Fetch URL with retry logic and exponential backoff.
         
         Args:
+            client: httpx AsyncClient instance
             url: URL to fetch
             timeout: Request timeout in seconds
             retry_count: Current retry attempt
@@ -130,13 +119,15 @@ class WebCrawler:
             Response object if successful, None otherwise
         """
         try:
-            response = self.session.get(url, timeout=timeout)
+            # Semaphore ensures we don't exceed max_concurrent requests
+            async with self.semaphore:
+                response = await client.get(url, timeout=timeout)
             
             # 200: Success
             if response.status_code == 200:
                 return response
             
-            # 301/302: Redirect (requests follows automatically)
+            # 301/302: Redirect (httpx follows automatically)
             elif response.status_code in [301, 302]:
                 print(f"  → Redirected to: {response.url}")
                 return response
@@ -146,33 +137,24 @@ class WebCrawler:
                 print(f"  ✗ Not Found (404): Skipping")
                 return None
             
-            # for 401 - unauthorized, skip unless you have credentials
-            # add authentication and retry
-
-            # for 403 - forbidden, "i know you are but you're not allowed"
-            # could be: bot detection, IP blocker, geographic restriction, actual forbidden content
-
             # 403/401: Forbidden/Unauthorized - rotate user agent and retry
             elif response.status_code in [403, 401]:
                 if retry_count < self.max_retries:
                     print(f"  ⚠ {response.status_code}: Rotating user agent and retrying...")
                     self.rotate_user_agent()
-                    time.sleep(1)
-                    return self.fetch_with_retry(url, timeout, retry_count + 1)
+                    await asyncio.sleep(1)
+                    return await self.fetch_with_retry(client, url, timeout, retry_count + 1)
                 else:
                     print(f"  ✗ {response.status_code}: Max retries reached")
                     return None
             
             # 429: Too Many Requests - exponential backoff with jitter
-            # rate limited
-            # thundering herd problem (all 1000 retry requests slam the server at the same time)
-            # jitter is needed to spread out requests over time
             elif response.status_code == 429:
                 if retry_count < self.max_retries:
                     backoff = (self.retry_delay_base ** retry_count) + random.uniform(0, 1)
                     print(f"  ⚠ 429: Rate limited, backing off for {backoff:.1f}s...")
-                    time.sleep(backoff)
-                    return self.fetch_with_retry(url, timeout, retry_count + 1)
+                    await asyncio.sleep(backoff)
+                    return await self.fetch_with_retry(client, url, timeout, retry_count + 1)
                 else:
                     print(f"  ✗ 429: Max retries reached")
                     return None
@@ -182,8 +164,8 @@ class WebCrawler:
                 if retry_count < self.max_retries:
                     backoff = self.retry_delay_base ** retry_count
                     print(f"  ⚠ {response.status_code}: Server error, retrying in {backoff}s... (attempt {retry_count + 1}/{self.max_retries})")
-                    time.sleep(backoff)
-                    return self.fetch_with_retry(url, timeout, retry_count + 1)
+                    await asyncio.sleep(backoff)
+                    return await self.fetch_with_retry(client, url, timeout, retry_count + 1)
                 else:
                     print(f"  ✗ {response.status_code}: Max retries reached")
                     return None
@@ -192,44 +174,45 @@ class WebCrawler:
                 print(f"  ? Unexpected status code: {response.status_code}")
                 return None
         
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             # Timeout - retry with longer timeout
             if retry_count < self.max_retries:
                 new_timeout = timeout + 5
                 print(f"  ⚠ Timeout: Retrying with {new_timeout}s timeout... (attempt {retry_count + 1}/{self.max_retries})")
-                time.sleep(1)
-                return self.fetch_with_retry(url, new_timeout, retry_count + 1)
+                await asyncio.sleep(1)
+                return await self.fetch_with_retry(client, url, new_timeout, retry_count + 1)
             else:
                 print(f"  ✗ Timeout: Max retries reached")
                 return None
         
-        except requests.exceptions.ConnectionError:
+        except httpx.ConnectError:
             # Connection error - retry with backoff
             if retry_count < self.max_retries:
                 backoff = self.retry_delay_base ** retry_count
                 print(f"  ⚠ Connection Error: Retrying in {backoff}s... (attempt {retry_count + 1}/{self.max_retries})")
-                time.sleep(backoff)
-                return self.fetch_with_retry(url, timeout, retry_count + 1)
+                await asyncio.sleep(backoff)
+                return await self.fetch_with_retry(client, url, timeout, retry_count + 1)
             else:
                 print(f"  ✗ Connection Error: Max retries reached")
                 return None
         
-        except requests.exceptions.RequestException as e:
+        except httpx.HTTPError as e:
             print(f"  ✗ Error: {e}")
             return None
     
-    def get_links(self, url: str, base_domain: str) -> List[str]:
+    async def get_links(self, client: httpx.AsyncClient, url: str, base_domain: str) -> List[str]:
         """
         Extract all links from a webpage.
         
         Args:
+            client: httpx AsyncClient instance
             url: URL to extract links from
             base_domain: Base domain to filter links
             
         Returns:
             List of valid URLs found on the page
         """
-        response = self.fetch_with_retry(url)
+        response = await self.fetch_with_retry(client, url)
         
         if response is None:
             return []
@@ -244,31 +227,31 @@ class WebCrawler:
             # Remove fragments
             absolute_url = absolute_url.split('#')[0]
             
-            # is_valid_url now handles domain check AND file filtering
+            # is_valid_url handles domain check AND file filtering
             if self.is_valid_url(absolute_url, base_domain):
                 links.append(absolute_url)
         
         return links
     
-    def _crawl_url(self, url: str, base_domain: str) -> tuple[str, List[str]]:
+    async def crawl_url(self, client: httpx.AsyncClient, url: str, base_domain: str) -> List[str]:
         """
-        Crawl a single URL and return its links (thread-safe helper).
+        Crawl a single URL and return its links.
         
         Args:
+            client: httpx AsyncClient instance
             url: URL to crawl
             base_domain: Base domain for filtering
             
         Returns:
-            Tuple of (url, list of links found)
+            List of links found on the page
         """
         print(f"Crawling: {url}")
-        links = self.get_links(url, base_domain)
-        return (url, links)
+        links = await self.get_links(client, url, base_domain)
+        return links
     
-    def crawl(self, start_url: str) -> Set[str]:
+    async def crawl(self, start_url: str) -> Set[str]:
         """
-        Crawl website starting from the given URL.
-        Uses ThreadPoolExecutor for parallel crawling if max_workers > 1.
+        Crawl website starting from the given URL using async/await.
         
         Args:
             start_url: URL to start crawling from
@@ -279,84 +262,54 @@ class WebCrawler:
         base_domain = urlparse(start_url).netloc
         to_visit = deque([start_url])
         
-        mode = "parallel" if self.max_workers > 1 else "single-threaded"
-        print(f"Starting {mode} crawl from: {start_url}")
+        print(f"Starting async crawl from: {start_url}")
         print(f"Base domain: {base_domain}")
         print(f"Max pages: {self.max_pages}")
-        if self.max_workers > 1:
-            print(f"Workers: {self.max_workers}")
+        print(f"Max concurrent requests: {self.max_concurrent}")
         
         # Load robots.txt
-        self.load_robots_txt(start_url)
+        await self.load_robots_txt(start_url)
         print()
         
-        if self.max_workers == 1:
-            # Single-threaded crawl (original behavior)
+        # Create httpx client with custom headers
+        async with httpx.AsyncClient(
+            headers={'User-Agent': self.current_user_agent},
+            follow_redirects=True
+        ) as client:
+            
             while to_visit and len(self.visited_urls) < self.max_pages:
-                url = to_visit.popleft()
+                # Prepare batch of URLs to crawl
+                batch = []
+                batch_size = min(self.max_concurrent, len(to_visit), 
+                               self.max_pages - len(self.visited_urls))
                 
-                if url in self.visited_urls:
-                    continue
-                
-                if not self.can_fetch(url):
-                    print(f"Skipping (disallowed by robots.txt): {url}")
-                    continue
-                
-                print(f"Crawling [{len(self.visited_urls) + 1}/{self.max_pages}]: {url}")
-                self.visited_urls.add(url)
-                
-                links = self.get_links(url, base_domain)
-                
-                for link in links:
-                    if link not in self.visited_urls and link not in to_visit:
-                        to_visit.append(link)
-                
-                time.sleep(self.delay)
-        else:
-            # Multi-threaded crawl using ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                while to_visit and len(self.visited_urls) < self.max_pages:
-                    # Prepare batch of URLs to crawl
-                    batch = []
-                    batch_size = min(self.max_workers, len(to_visit), 
-                                   self.max_pages - len(self.visited_urls))
-                    
-                    for _ in range(batch_size):
-                        if to_visit:
-                            url = to_visit.popleft()
-                            
-                            # Thread-safe check
-                            with self.lock:
-                                if url not in self.visited_urls and self.can_fetch(url):
-                                    self.visited_urls.add(url)
-                                    batch.append(url)
-                    
-                    if not batch:
-                        break
-                    
-                    # Submit batch to thread pool
-                    futures = {
-                        executor.submit(self._crawl_url, url, base_domain): url 
-                        for url in batch
-                    }
-                    
-                    # Process results as threads complete
-                    for future in as_completed(futures):
-                        url = futures[future]
-                        try:
-                            crawled_url, links = future.result()
-                            
-                            # Thread-safe addition of new links
-                            with self.lock:
-                                for link in links:
-                                    if link not in self.visited_urls and link not in to_visit:
-                                        to_visit.append(link)
+                for _ in range(batch_size):
+                    if to_visit:
+                        url = to_visit.popleft()
                         
-                        except Exception as e:
-                            print(f"Error crawling {url}: {e}")
-                    
-                    # Rate limiting between batches
-                    time.sleep(self.delay)
+                        if url not in self.visited_urls and self.can_fetch(url):
+                            self.visited_urls.add(url)
+                            batch.append(url)
+                
+                if not batch:
+                    break
+                
+                # Crawl batch concurrently
+                tasks = [self.crawl_url(client, url, base_domain) for url in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        print(f"Error crawling {batch[i]}: {result}")
+                    else:
+                        # Add new links to queue
+                        for link in result:
+                            if link not in self.visited_urls and link not in to_visit:
+                                to_visit.append(link)
+                
+                # Rate limiting between batches
+                await asyncio.sleep(self.delay)
         
         print(f"\nCrawling complete! Visited {len(self.visited_urls)} pages.")
         if self.files_found:
@@ -364,7 +317,7 @@ class WebCrawler:
         return self.visited_urls
 
 
-def main():
+async def main():
     # Test websites for web scraping practice
     test_sites = [
         "https://books.toscrape.com/",
@@ -376,9 +329,9 @@ def main():
     # Choose which site to crawl (change index to test different sites)
     start_url = test_sites[0]
     
-    # max_workers=1 for single-threaded, 5 for parallel crawling
-    crawler = WebCrawler(max_pages=20, delay=1.0, max_workers=5)
-    visited_urls = crawler.crawl(start_url)
+    # max_concurrent controls how many requests happen at once
+    crawler = AsyncWebCrawler(max_pages=20, delay=1.0, max_concurrent=10)
+    visited_urls = await crawler.crawl(start_url)
     
     # Print results
     print("\n" + "="*50)
@@ -397,4 +350,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
