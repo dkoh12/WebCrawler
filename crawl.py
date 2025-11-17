@@ -99,7 +99,8 @@ class WebCrawler:
                           '.css', '.js', '.woff', '.woff2', '.ttf', '.eot')
         
         if url.lower().endswith(skip_extensions):
-            self.files_found.add(url)
+            with self.lock:
+                self.files_found.add(url)
             return False
         
         return True
@@ -313,6 +314,9 @@ class WebCrawler:
                 
                 time.sleep(self.delay)
         else:
+            # no need for a rate-limiter, because number of threads are 
+            # limited by thread count (max_workers)
+
             # Multi-threaded crawl using ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 while to_visit and len(self.visited_urls) < self.max_pages:
@@ -325,11 +329,9 @@ class WebCrawler:
                         if to_visit:
                             url = to_visit.popleft()
                             
-                            # Thread-safe check
-                            with self.lock:
-                                if url not in self.visited_urls and self.can_fetch(url):
-                                    self.visited_urls.add(url)
-                                    batch.append(url)
+                            if url not in self.visited_urls and self.can_fetch(url):
+                                self.visited_urls.add(url)
+                                batch.append(url)
                     
                     if not batch:
                         break
@@ -346,11 +348,9 @@ class WebCrawler:
                         try:
                             crawled_url, links = future.result()
                             
-                            # Thread-safe addition of new links
-                            with self.lock:
-                                for link in links:
-                                    if link not in self.visited_urls and link not in to_visit:
-                                        to_visit.append(link)
+                            for link in links:
+                                if link not in self.visited_urls and link not in to_visit:
+                                    to_visit.append(link)
                         
                         except Exception as e:
                             print(f"Error crawling {url}: {e}")
