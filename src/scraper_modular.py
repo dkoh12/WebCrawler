@@ -17,7 +17,8 @@ class QuoteScraper:
         base_url: str,
         delay: float = 1.0,
         headless: bool = True,
-        max_retries: int = 3
+        max_retries: int = 3,
+        selectors: Optional[Dict[str, str]] = None
     ):
         """
         Initialize the quote scraper.
@@ -27,14 +28,21 @@ class QuoteScraper:
             delay: Delay between requests in seconds
             headless: Whether to run browser in headless mode
             max_retries: Maximum retry attempts for failed requests
+            selectors: Custom CSS selectors for quote elements
         """
         self.base_url = base_url
         self.delay = delay
         self.browser = BrowserManager(headless=headless)
         self.response_handler = ResponseHandler(max_retries=max_retries)
-        self.parser = QuoteParser()
+        self.parser = QuoteParser(selectors=selectors)
         self.data_store = DataStore()
         self._browser_started = False
+        self.selectors = selectors or {
+            'quote': '.quote',
+            'text': '.text',
+            'author': '.author',
+            'tags': '.tag'
+        }
     
     async def start(self):
         """Start the browser. Call once before scraping."""
@@ -75,7 +83,11 @@ class QuoteScraper:
             return [], None
         
         # Wait for content to load
-        await self.browser.wait_for_selector('.quote', timeout=10000)
+        try:
+            await self.browser.wait_for_selector(self.selectors['quote'], timeout=10000)
+        except Exception as e:
+            print(f"  ⚠ Could not find quote selector '{self.selectors['quote']}': {e}")
+            return [], None
         
         # If using scroll, scroll to load all content
         if use_scroll:
@@ -83,7 +95,7 @@ class QuoteScraper:
             print(f"  Scrolled {scroll_count} times to load content")
         
         # Extract quotes
-        quote_elements = await self.browser.query_selector_all('.quote')
+        quote_elements = await self.browser.query_selector_all(self.selectors['quote'])
         quotes = await self.parser.parse_quotes(quote_elements)
         
         # Extract next page URL (only if not using scroll)
@@ -210,32 +222,46 @@ async def main():
     """Example usage of modular scraper."""
     # List of available URLs
     urls = [
-        "https://quotes.toscrape.com/",
-        "https://quotes.toscrape.com/scroll",
-        "https://quotes.toscrape.com/js/",
-        "https://quotes.toscrape.com/js-delayed/",
-        "https://quotes.toscrape.com/tableful/",
-        "https://quotes.toscrape.com/login",
-        "https://quotes.toscrape.com/search.aspx",
-        "https://quotes.toscrape.com/random"
+        "https://quotes.toscrape.com/", # microdata and pagination
+        "https://quotes.toscrape.com/scroll", # infinite scrolling pagination
+        "https://quotes.toscrape.com/js/", # JavaScript generated content
+        "https://quotes.toscrape.com/js-delayed/", # Same as JavaScript but with a delay 
+        "https://quotes.toscrape.com/tableful/", # table based messed-up layout
+        "https://quotes.toscrape.com/login", # login with CSRF token (any user/passwd works)
+        "https://quotes.toscrape.com/search.aspx", # an AJAX based filter form with ViewStates
+        "https://quotes.toscrape.com/random" # single random quote
     ]
     
-    seed_url = urls[1]
+    seed_url = urls[6]
     print(f"Available URLs: {len(urls)}")
     print(f"Using seed URL: {seed_url}\n")
     
+    # Detect if we need custom selectors for table-based layout
+    selectors = None
+    if 'tableful' in seed_url:
+        # Table layout uses a completely different structure
+        # We'll use a special selector to find rows with quotes
+        selectors = {
+            'quote': 'td[style*="padding-top"]',  # Rows with quote text
+            'text': None,  # Will parse from text content
+            'author': None,  # Will parse from text content
+            'tags': None  # Will parse from next sibling
+        }
+        print("Using table-based selectors\n")
+    
     # Create scraper and start browser once
-    scraper = QuoteScraper(base_url=seed_url, delay=1.0, headless=True)
+    scraper = QuoteScraper(base_url=seed_url, delay=1.0, headless=True, selectors=selectors)
     await scraper.start()
     
     try:
-        # Example 1: Scrape all quotes (with scroll for infinite scroll pages)
+        # Example 1: Scrape all quotes
         print("=" * 60)
-        print("Example 1: Scraping all quotes with infinite scroll")
+        print("Example 1: Scraping all quotes")
         print("=" * 60)
         # Detect if URL uses scroll by checking if 'scroll' is in the URL
         use_scroll = 'scroll' in seed_url
-        all_quotes = await scraper.scrape_all(max_pages=1, max_concurrent=1, use_scroll=use_scroll)
+        max_pages = 1 if use_scroll else None  # None = scrape all pages
+        all_quotes = await scraper.scrape_all(max_pages=max_pages, max_concurrent=10, use_scroll=use_scroll)
         
         # Print stats
         print("\n" + "=" * 60)
