@@ -14,11 +14,32 @@ All of this means that requests.get() by itself is rarely enough. Modern crawler
 
 They need to mimic real browsers, rotate identities, respect site policies, and recover from failures automatically.
 
+**Rate Limiting & Throttling**
+
+If your crawler hits a website too quickly even politely and ethically you risk being flagged as a bot or triggering automated blocks. Web servers expect human-like timing: a few seconds between actions, not a barrage of requests per second.
+
+add delays between requests and randomized backoff range.
+
+**Rotating Headers, User Agents, Proxies**
+
+Even if your requests are respectful, websites can detect:
+
+Too many hits from the same IP
+Repetitive User-Agent strings
+Headers that don’t match real browser behavior
+
+To avoid this, we rotate
+- User-Agents to simulate different browsers
+- Headers to mimic real-world requests
+- Proxies to distribute traffic across IPs
+
+Real browsers always send User-Agent as part of the header. 
+
 ---
 
 Web crawling is I/O-bound (waiting for network), not CPU-bound (heavy computation).
 
-```
+```python
 from concurrent.futures import ThreadPoolExecutor
 
 # Uses OS threads (not async!)
@@ -27,14 +48,14 @@ with ThreadPoolExecutor(max_workers=5) as executor:
     result = future.result()  # Blocks until done
 ```
 
-ThreadPoolExecutor
+**ThreadPoolExecutor**
 - Creates real OS threads
 - Each thread runs synchronous code (like requests.get())
 - OS scheduler decides when to switch between threads
 - NOT async - just traditional threading
 
 
-```
+```python
 from concurrent.futures import ProcessPoolExecutor
 
 # Uses separate processes (for CPU-bound work)
@@ -43,14 +64,14 @@ with ProcessPoolExecutor(max_workers=5) as executor:
     result = future.result()
 ```
 
-ProcessPoolExecutor
+**ProcessPoolExecutor**
 - Creates separate Python processes
 - Each process has its own Python interpreter and memory
 - Bypasses GIL (each process has its own GIL)
 - Good for CPU-bound work, bad for I/O (huge overhead)
 - Uses multiprocessing under the hood
 
-```
+```python
 import asyncio
 import aiohttp
 
@@ -64,11 +85,47 @@ async def fetch(url):
 asyncio.run(fetch(url))
 ```
 
-Async / Await
+**Async / Await**
 - Single thread with event loop
 - Cooperative multitasking (await = "switch to another task")
 - No OS thread switching
 - Explicitly async code
+
+Because python's request module is synchronous, I cannot use requests with async/await
+
+## HTTP Libraries Comparison
+
+**requests** (synchronous)
+```python
+import requests
+response = requests.get(url)  # Blocks until response received
+```
+- Synchronous/blocking
+- Use with ThreadPoolExecutor for concurrency
+- Simple, widely used
+- File: crawl.py
+
+**httpx** (async support)
+```python
+import httpx
+async with httpx.AsyncClient() as client:
+    response = await client.get(url)  # Non-blocking with async
+```
+- Supports both sync and async
+- Drop-in replacement for requests API
+- Better for async/await patterns
+- File: crawl_async.py
+
+**aiohttp** (async only)
+```python
+import aiohttp
+async with aiohttp.ClientSession() as session:
+    async with session.get(url) as response:
+        text = await response.text()
+```
+- Async only
+- Very popular for async HTTP
+- Different API from requests
 
 ---
 
