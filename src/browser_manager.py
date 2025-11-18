@@ -77,6 +77,42 @@ class BrowserManager:
             raise RuntimeError("Browser not started. Call start() first.")
         return await self.page.query_selector_all(selector)
     
+    async def scroll_to_bottom(self, pause_time: float = 1.0, max_scrolls: int = 10):
+        """
+        Scroll to bottom of page to load dynamic content.
+        
+        Args:
+            pause_time: Time to wait between scrolls in seconds
+            max_scrolls: Maximum number of scroll attempts
+            
+        Returns:
+            Number of scrolls performed
+        """
+        if not self.page:
+            raise RuntimeError("Browser not started. Call start() first.")
+        
+        previous_height = 0
+        scroll_count = 0
+        
+        for i in range(max_scrolls):
+            # Get current scroll height
+            current_height = await self.page.evaluate("document.body.scrollHeight")
+            
+            # If height hasn't changed, we've reached the bottom
+            if current_height == previous_height:
+                break
+            
+            # Scroll to bottom
+            await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            
+            # Wait for content to load
+            await asyncio.sleep(pause_time)
+            
+            previous_height = current_height
+            scroll_count += 1
+        
+        return scroll_count
+    
     async def __aenter__(self):
         """Async context manager entry."""
         await self.start()

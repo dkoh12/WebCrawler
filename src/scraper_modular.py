@@ -2,6 +2,7 @@
 """Modular web scraper using Playwright with async/await."""
 import asyncio
 from typing import List, Dict, Optional
+from collections import deque
 from browser_manager import BrowserManager
 from response_handler import ResponseHandler
 from quote_parser import QuoteParser
@@ -33,71 +34,70 @@ class QuoteScraper:
         self.response_handler = ResponseHandler(max_retries=max_retries)
         self.parser = QuoteParser()
         self.data_store = DataStore()
+        self._browser_started = False
     
     async def start(self):
-        """Initialize browser."""
-        await self.browser.start()
+        """Start the browser. Call once before scraping."""
+        if not self._browser_started:
+            await self.browser.start()
+            self._browser_started = True
     
     async def close(self):
-        """Close browser."""
-        await self.browser.close()
+        """Close the browser. Call when done with all scraping."""
+        if self._browser_started:
+            await self.browser.close()
+            self._browser_started = False
     
-    async def scrape_page(self, url: str, retry_count: int = 0) -> tuple[List[Dict], Optional[str]]:
+    async def scrape_page(self, url: str, retry_count: int = 0, use_scroll: bool = False) -> tuple[List[Dict], Optional[str]]:
         """
         Scrape a single page.
         
         Args:
             url: URL to scrape
             retry_count: Current retry attempt
+            use_scroll: Whether to use infinite scroll instead of pagination
             
         Returns:
             Tuple of (quotes list, next page URL)
         """
-        try:
-            # Navigate to page
-            response = await self.browser.navigate(url)
-            
-            # Handle response status with retry logic
-            async def retry_scrape(count: int):
-                return await self.scrape_page(url, count)
-            
-            is_ok = await self.response_handler.handle_response(
-                response, url, retry_scrape, retry_count
-            )
-            
-            if not is_ok:
-                return [], None
-            
-            # Wait for content to load
-            try:
-                await self.browser.wait_for_selector('.quote', timeout=10000)
-            except Exception as e:
-                print(f"  ⚠ Timeout waiting for content: {e}")
-                return [], None
-            
-            # Extract quotes
-            quote_elements = await self.browser.query_selector_all('.quote')
-            quotes = await self.parser.parse_quotes(quote_elements)
-            
-            # Extract next page URL
-            next_url = await self.parser.extract_next_page_url(
-                self.browser.page, self.base_url
-            )
-            
-            return quotes, next_url
+        # Navigate to page
+        response = await self.browser.navigate(url)
         
-        except Exception as e:
-            print(f"  ✗ Error scraping {url}: {e}")
-            if retry_count < self.response_handler.max_retries:
-                print(f"  ↻ Retrying... (attempt {retry_count + 1}/{self.response_handler.max_retries})")
-                await asyncio.sleep(2)
-                return await self.scrape_page(url, retry_count + 1)
+        # Handle response status
+        is_ok = await self.response_handler.handle_response(
+            response, 
+            url,
+            retry_callback=lambda rc: self.scrape_page(url, rc, use_scroll),
+            retry_count=retry_count
+        )
+        
+        if not is_ok:
             return [], None
+        
+        # Wait for content to load
+        await self.browser.wait_for_selector('.quote', timeout=10000)
+        
+        # If using scroll, scroll to load all content
+        if use_scroll:
+            scroll_count = await self.browser.scroll_to_bottom(pause_time=1.0, max_scrolls=10)
+            print(f"  Scrolled {scroll_count} times to load content")
+        
+        # Extract quotes
+        quote_elements = await self.browser.query_selector_all('.quote')
+        quotes = await self.parser.parse_quotes(quote_elements)
+        
+        # Extract next page URL (only if not using scroll)
+        next_url = None if use_scroll else await self.parser.extract_next_page_url(
+            self.browser.page, self.base_url
+        )
+        
+        return quotes, next_url
     
     async def scrape_all(
         self,
         max_pages: Optional[int] = None,
-        max_concurrent: int = 5
+        max_concurrent: int = 5,
+        use_scroll: bool = False
     ) -> List[Dict]:
         """
         Scrape all pages in parallel.
@@ -105,27 +105,28 @@ class QuoteScraper:
         Args:
             max_pages: Maximum number of pages to scrape
             max_concurrent: Maximum concurrent page scrapes
+            use_scroll: Whether to use infinite scroll instead of pagination
             
         Returns:
             List of all quotes
         """
         all_quotes = []
         visited_urls = set()
-        to_visit = [self.base_url]
+        to_visit = deque([self.base_url])
         page_count = 0
         semaphore = asyncio.Semaphore(max_concurrent)
         lock = asyncio.Lock()
         
-        print(f"Starting parallel scrape from: {self.base_url}")
+        print(f"Starting {'scroll' if use_scroll else 'parallel'} scrape from: {self.base_url}")
         print(f"Max pages: {max_pages if max_pages else 'All'}")
         print(f"Max concurrent: {max_concurrent}")
         print()
         
-        async def scrape_with_semaphore(url: str):
-            """Scrape with concurrency control."""
+        async def scrape_url_task(url: str):
+            """Task to scrape a single URL with concurrency control."""
             async with semaphore:
                 print(f"Scraping: {url}")
-                quotes, next_url = await self.scrape_page(url)
+                quotes, next_url = await self.scrape_page(url, use_scroll=use_scroll)
                 
                 async with lock:
                     all_quotes.extend(quotes)
@@ -147,7 +148,7 @@ class QuoteScraper:
             batch = []
             for _ in range(batch_size):
                 if to_visit:
-                    url = to_visit.pop(0)
+                    url = to_visit.popleft()
                     if url not in visited_urls:
                         visited_urls.add(url)
                         batch.append(url)
@@ -157,7 +158,7 @@ class QuoteScraper:
                 break
             
             # Scrape batch in parallel
-            tasks = [scrape_with_semaphore(url) for url in batch]
+            tasks = [scrape_url_task(url) for url in batch]
             await asyncio.gather(*tasks)
         
         print(f"\nScraping complete!")
@@ -203,15 +204,6 @@ class QuoteScraper:
     def save_quotes(self, quotes: List[Dict], filename: str):
         """Save quotes to JSON file."""
         self.data_store.save_to_json(quotes, filename)
-    
-    async def __aenter__(self):
-        """Async context manager entry."""
-        await self.start()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        await self.close()
 
 
 async def main():
@@ -228,17 +220,22 @@ async def main():
         "https://quotes.toscrape.com/random"
     ]
     
-    seed_url = urls[0]
+    seed_url = urls[1]
     print(f"Available URLs: {len(urls)}")
     print(f"Using seed URL: {seed_url}\n")
     
-    # Use async context manager
-    async with QuoteScraper(base_url=seed_url, delay=1.0, headless=True) as scraper:
-        # Scrape all quotes (parallel)
+    # Create scraper and start browser once
+    scraper = QuoteScraper(base_url=seed_url, delay=1.0, headless=True)
+    await scraper.start()
+    
+    try:
+        # Example 1: Scrape all quotes (with scroll for infinite scroll pages)
         print("=" * 60)
-        print("Scraping all quotes (first 3 pages, max 5 concurrent)")
+        print("Example 1: Scraping all quotes with infinite scroll")
         print("=" * 60)
-        all_quotes = await scraper.scrape_all(max_pages=3, max_concurrent=5)
+        # Detect if URL uses scroll by checking if 'scroll' is in the URL
+        use_scroll = 'scroll' in seed_url
+        all_quotes = await scraper.scrape_all(max_pages=1, max_concurrent=1, use_scroll=use_scroll)
         
         # Print stats
         print("\n" + "=" * 60)
@@ -263,6 +260,25 @@ async def main():
         
         # Save to JSON
         scraper.save_quotes(all_quotes, "quotes_all.json")
+        
+        # Example 2: Scrape by tag (reusing same browser!)
+        print("\n\n" + "=" * 60)
+        print("Example 2: Scraping quotes with 'love' tag (reusing browser)")
+        print("=" * 60)
+        love_quotes = await scraper.scrape_by_tag('love')
+        
+        print("\n" + "=" * 60)
+        print("Sample Love Quotes:")
+        print("=" * 60)
+        for i, quote in enumerate(love_quotes[:2], 1):
+            print(f"\n{i}. {quote['text']}")
+            print(f"   - {quote['author']}")
+        
+        scraper.save_quotes(love_quotes, "quotes_love.json")
+        
+    finally:
+        # Close browser once when done with all scraping
+        await scraper.close()
 
 
 if __name__ == "__main__":
